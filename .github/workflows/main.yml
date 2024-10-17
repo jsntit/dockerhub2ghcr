@@ -36,10 +36,13 @@ jobs:
         run: |
           docker pull ${{ inputs.dockerhub_image }}:${{ inputs.tag }}
 
+      - name: 设置小写的 GitHub 用户名
+        run: echo "ACTOR_LOWER=$(echo '${{ github.actor }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+      
       - name: 为GitHub容器注册表标记Docker镜像
         run: |
-          docker tag ${{ inputs.dockerhub_image }}:${{ inputs.tag }} ${{ env.REGISTRY }}/${{ github.actor }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
-
+          docker tag ${{ inputs.dockerhub_image }}:${{ inputs.tag }} ${{ env.REGISTRY }}/${{ env.ACTOR_LOWER }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+      
       - name: 将Docker镜像推送到GitHub容器注册表
         run: |
-          docker push ${{ env.REGISTRY }}/${{ github.actor }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+          docker push ${{ env.REGISTRY }}/${{ env.ACTOR_LOWER }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}

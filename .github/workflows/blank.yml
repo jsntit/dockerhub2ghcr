@@ -1,4 +1,4 @@
-name: 将DockerHub镜像复制到GHCR.IO
+name: 将DockerHub镜像复制到GHCR.IO-指定平台
 
 on:
   workflow_dispatch:

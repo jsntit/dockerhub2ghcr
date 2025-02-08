@@ -15,7 +15,10 @@ on:
         description: '推送到GHCR.IO的镜像名称'
         required: true
         default: 'myimage'
-
+      platform:
+        description: '推送到GHCR.IO的镜像平台'
+        required: true
+        default: 'linux/amd64'
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ inputs.ghcr_image }}  
@@ -34,7 +37,7 @@ jobs:
 
       - name: 从DockerHub拉取Docker镜像
         run: |
-          docker pull ${{ inputs.dockerhub_image }}:${{ inputs.tag }}
+          docker pull --platform ${{ inputs.platform }} ${{ inputs.dockerhub_image }}:${{ inputs.tag }}
 
       - name: 设置小写的 GitHub 用户名
         run: echo "ACTOR_LOWER=$(echo '${{ github.actor }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV

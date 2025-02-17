@@ -48,4 +48,4 @@ jobs:
       
       - name: 将Docker镜像推送到GitHub容器注册表
         run: |
-          docker push ${{ env.REGISTRY }}/${{ env.ACTOR_LOWER }}/${{ env.IMAGE_NAME }}:${{ inputs.tag }}
+          docker push ${{ env.REGISTRY }}/${{ env.ACTOR_LOWER }}/${{ env.IMAGE_NAME }}-{{ inputs.platform }}:${{ inputs.tag }}

@@ -29,6 +29,18 @@ on:
         description: 'GHCR 命名空间（用户/组织，默认仓库所有者）'
         required: false
         default: ''
+      cleanup:
+        description: '清理策略：none=不动；purge=先删整个目标包再推（历史 tag 全清）；prune=推完只保留最近 N 个版本'
+        type: choice
+        options:
+          - none
+          - purge
+          - prune
+        default: none
+      keep_versions:
+        description: 'cleanup=prune 时保留的版本数（含本次新推的）'
+        required: false
+        default: '5'
 
 permissions:
   contents: read
@@ -53,6 +65,8 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
           NAMESPACE: ${{ inputs.namespace }}
           OWNER: ${{ github.repository_owner }}
+          CLEANUP: ${{ inputs.cleanup }}
+          KEEP: ${{ inputs.keep_versions }}
         run: |
           set -euo pipefail
 
@@ -133,6 +147,7 @@ jobs:
             echo "| 目标 | \`${dst_repo}\` |"
             echo "| tag | \`${taglist}\` |"
             echo "| 平台 | \`${plats}\` |"
+            echo "| 清理 | \`${CLEANUP:-none}\`$( [ "${CLEANUP:-none}" = prune ] && echo "（保留 ${KEEP:-5} 个版本）" ) |"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 安装 skopeo
@@ -146,6 +161,33 @@ jobs:
           GH_USER: ${{ github.actor }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
+
+      - name: 清理目标包（cleanup=purge：先整包删除）
+        if: inputs.cleanup == 'purge'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          DST_REPO: ${{ steps.norm.outputs.dst }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          ns="$(echo "$DST_REPO" | sed -E 's#^ghcr\.io/##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
+          pkg="${DST_REPO##*/}"
+          owner="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$ns" != "$owner" ]; then
+            echo "::warning::目标命名空间 $ns 不是仓库所有者 $owner，token 无权删除，跳过 purge"
+            exit 0
+          fi
+
+          base="$(gh api "/users/$owner" --jq .type 2>/dev/null | grep -qi '^Organization$' \
+                  && echo "/orgs/$owner/packages" || echo "/user/packages")"
+          if gh api "$base/container/$pkg" >/dev/null 2>&1; then
+            gh api --method DELETE "$base/container/$pkg" >/dev/null
+            echo "已删除包 $ns/$pkg（历史 tag 一并清空）"
+            echo "- purge：已删除整个包 \`$ns/$pkg\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "包 $ns/$pkg 不存在，无需清理"
+          fi
 
       - name: 登录 Docker Hub（可选，规避匿名限流 429）
         env:
@@ -222,3 +264,49 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           done
           exit "$rc"
+
+      - name: 裁剪旧版本（cleanup=prune：只保留最近 N 个）
+        if: inputs.cleanup == 'prune'
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          DST_REPO: ${{ steps.norm.outputs.dst }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          KEEP: ${{ inputs.keep_versions }}
+        run: |
+          set -euo pipefail
+          pkg="${DST_REPO##*/}"
+          ns="$(echo "$DST_REPO" | sed -E 's#^ghcr\.io/##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
+          owner="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$ns" != "$owner" ]; then
+            echo "::warning::目标命名空间 $ns 不是仓库所有者 $owner，token 无权删除，跳过 prune"
+            exit 0
+          fi
+          if ! [[ "$KEEP" =~ ^[0-9]+$ ]] || [ "$KEEP" -lt 1 ]; then
+            echo "::error::keep_versions 必须是 >=1 的整数（当前：$KEEP）"; exit 1
+          fi
+
+          base="$(gh api "/users/$owner" --jq .type 2>/dev/null | grep -qi '^Organization$' \
+                  && echo "/orgs/$owner/packages" || echo "/user/packages")"
+          if ! gh api "$base/container/$pkg" >/dev/null 2>&1; then
+            echo "包 $ns/$pkg 不存在（推送可能失败），跳过"
+            exit 0
+          fi
+
+          mapfile -t rows < <(
+            gh api --paginate "$base/container/$pkg/versions?per_page=100" \
+              --jq '.[] | "\(.created_at)\t\(.id)\t\((.metadata.container.tags // []) | join(","))"' \
+              | sort -r
+          )
+          total=${#rows[@]}
+          echo "包 $ns/$pkg 当前 $total 个版本，保留最近 $KEEP 个"
+          dropped=0
+          if [ "$total" -gt "$KEEP" ]; then
+            for ((i=KEEP; i<total; i++)); do
+              IFS=$'\t' read -r ts id tags <<<"${rows[$i]}"
+              gh api --method DELETE "$base/container/$pkg/versions/$id" >/dev/null
+              echo "  已删除版本 $id（$ts，tags=${tags:-<none>}）"
+              dropped=$((dropped+1))
+            done
+          fi
+          echo "- prune：\`$ns/$pkg\` 共 $total 个版本，保留 $KEEP 个，删除 $dropped 个" >> "$GITHUB_STEP_SUMMARY"

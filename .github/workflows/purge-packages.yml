@@ -1,0 +1,210 @@
+name: 清空 GHCR 包
+
+# 用途：一次性清理本仓库（或整个账号/组织）下由本 workflow 推上去的容器包。
+# 安全设计：默认 dry_run=true，只打印"会删什么"；真删必须同时把 dry_run 关掉并输入 confirm=DELETE。
+#
+# 注意：GitHub 网页端没有批量删除包的入口，只能逐个进包设置页点 Delete，
+#       这个 workflow 就是补这个缺口。
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: '删除范围：repo=只删关联到本仓库的包；all=仓库所有者名下所有容器包'
+        type: choice
+        options:
+          - repo
+          - all
+        default: repo
+      packages:
+        description: '指定包名（逗号分隔），填了就忽略 scope；留空=按 scope 自动枚举'
+        required: false
+        default: ''
+      keep_versions:
+        description: '每个包保留最近 N 个版本；0=整包删除（推荐，tag 一并清空）'
+        required: false
+        default: '0'
+      dry_run:
+        description: '只预览，不实际删除'
+        type: boolean
+        default: true
+      confirm:
+        description: '真删（dry_run=false）时必须输入 DELETE'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: purge-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  purge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: 预检参数与 token
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          DRY: ${{ inputs.dry_run }}
+          CONFIRM: ${{ inputs.confirm }}
+          KEEP: ${{ inputs.keep_versions }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+
+          login="$(gh api /user --jq .login)"
+          echo "token 身份：$login"
+
+          if ! [[ "$KEEP" =~ ^[0-9]+$ ]]; then
+            echo "::error::keep_versions 必须是非负整数（当前：$KEEP）"; exit 1
+          fi
+
+          if [ "$DRY" != "true" ] && [ "$CONFIRM" != "DELETE" ]; then
+            echo "::error::dry_run 关闭时必须把 confirm 填成 DELETE（怕手滑）"; exit 1
+          fi
+
+          {
+            echo "### 清空计划"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 身份 | \`$login\` |"
+            echo "| 范围 | \`$SCOPE\` |"
+            echo "| 保留版本 | \`$KEEP\`（0 = 整包删除） |"
+            echo "| 模式 | \`$( [ "$DRY" = "true" ] && echo 预览/dry-run || echo 实际删除 )\` |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 执行清空
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          DRY: ${{ inputs.dry_run }}
+          KEEP: ${{ inputs.keep_versions }}
+          SCOPE: ${{ inputs.scope }}
+          PKGS_INPUT: ${{ inputs.packages }}
+          REPO_FULL: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          owner="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+          type="$(gh api "/users/$owner" --jq .type 2>/dev/null || echo User)"
+          if [ "$type" = "Organization" ]; then
+            base="/orgs/$owner/packages"
+            list_base="/orgs/$owner/packages"
+            who="$owner（组织）"
+          else
+            base="/user/packages"
+            list_base="/user/packages"
+            who="$owner（用户）"
+          fi
+          echo "包归属：$who"
+
+          # 选出要处理的包
+          targets=()
+          if [ -n "${PKGS_INPUT// /}" ]; then
+            while IFS= read -r p; do
+              [ -n "$p" ] && targets+=("$p")
+            done < <(echo "$PKGS_INPUT" | tr ',' '\n' | tr -d ' \t')
+          else
+            if [ "$SCOPE" = "all" ]; then
+              while IFS= read -r p; do [ -n "$p" ] && targets+=("$p"); done < <(
+                gh api --paginate "$list_base?package_type=container&per_page=100" --jq '.[].name'
+              )
+            else
+              while IFS= read -r p; do [ -n "$p" ] && targets+=("$p"); done < <(
+                REPO="$REPO_FULL" gh api --paginate "$list_base?package_type=container&per_page=100" \
+                  --jq '.[] | select(.repository.full_name == env.REPO) | .name'
+              )
+            fi
+          fi
+
+          if [ ${#targets[@]} -eq 0 ]; then
+            echo "没有匹配到任何包，结束"
+            echo "- 没有匹配到任何包" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "待处理 ${#targets[@]} 个包：${targets[*]}"
+          {
+            echo "| 包 | 版本数 | 动作 | 结果 |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          deleted_pkgs=0
+          deleted_vers=0
+
+          for pkg in "${targets[@]}"; do
+            if ! gh api "$base/container/$pkg" >/dev/null 2>&1; then
+              echo "跳过 $pkg（不存在或无权限）"
+              echo "| \`$pkg\` | - | - | 不存在/无权限 |" >> "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+
+            mapfile -t rows < <(
+              gh api --paginate "$base/container/$pkg/versions?per_page=100" \
+                --jq '.[] | "\(.created_at)\t\(.id)\t\((.metadata.container.tags // []) | join(","))"' \
+                | sort -r
+            )
+            total=${#rows[@]}
+
+            if [ "$KEEP" -eq 0 ]; then
+              if [ "$DRY" = "true" ]; then
+                echo "[dry-run] 将删除整包 $pkg（$total 个版本）"
+                echo "| \`$pkg\` | $total | 删整包 | 预览 |" >> "$GITHUB_STEP_SUMMARY"
+              else
+                gh api --method DELETE "$base/container/$pkg" >/dev/null
+                echo "已删除整包 $pkg（$total 个版本）"
+                echo "| \`$pkg\` | $total | 删整包 | 已删除 |" >> "$GITHUB_STEP_SUMMARY"
+                deleted_pkgs=$((deleted_pkgs+1)); deleted_vers=$((deleted_vers+total))
+              fi
+            else
+              if [ "$total" -le "$KEEP" ]; then
+                echo "$pkg：$total 个版本 <= 保留数 $KEEP，跳过"
+                echo "| \`$pkg\` | $total | 保留 $KEEP | 跳过 |" >> "$GITHUB_STEP_SUMMARY"
+                continue
+              fi
+              n=$((total-KEEP))
+              for ((i=KEEP; i<total; i++)); do
+                IFS=$'\t' read -r ts id tags <<<"${rows[$i]}"
+                if [ "$DRY" = "true" ]; then
+                  echo "[dry-run] 将删除 $pkg 版本 $id（$ts，tags=${tags:-<none>}）"
+                else
+                  gh api --method DELETE "$base/container/$pkg/versions/$id" >/dev/null
+                  echo "已删除 $pkg 版本 $id（$ts）"
+                  deleted_vers=$((deleted_vers+1))
+                fi
+              done
+              echo "| \`$pkg\` | $total | 保留最近 $KEEP，删 $n | $( [ "$DRY" = "true" ] && echo 预览 || echo 已删除 ) |" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+
+          {
+            echo ""
+            if [ "$DRY" = "true" ]; then
+              echo "> 这是 **预览**。确认无误后重新运行，把 dry_run 关掉并在 confirm 填 \`DELETE\`。"
+            else
+              echo "> 实际删除：**$deleted_pkgs 个整包**、其余包合计 **$deleted_vers 个版本**。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 复核剩余
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+          type="$(gh api "/users/$owner" --jq .type 2>/dev/null || echo User)"
+          if [ "$type" = "Organization" ]; then list_base="/orgs/$owner/packages"; else list_base="/user/packages"; fi
+          left="$(REPO="$REPO_FULL" gh api --paginate "$list_base?package_type=container&per_page=100" \
+                  --jq '[ .[] | select(.repository.full_name == env.REPO) | .name ] | join(", ")')"
+          echo "本仓库剩余容器包：${left:-（无）}"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "剩余（本仓库关联）：\`${left:-无}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -38,7 +38,7 @@ on:
           - prune
         default: none
       keep_versions:
-        description: 'cleanup=prune 时保留的版本数（含本次新推的）'
+        description: 'cleanup=prune 时保留的 tag 数（含本次新推的；多架构镜像按 tag 整组保留）'
         required: false
         default: '5'
 
@@ -301,20 +301,62 @@ jobs:
             exit 0
           fi
 
-          mapfile -t rows < <(
+          # 所有 version：id / digest / tags / created_at（新的在前）
+          mapfile -t all < <(
             gh api --paginate "$base/container/$pkg/versions?per_page=100" \
-              --jq '.[] | "\(.created_at)\t\(.id)\t\((.metadata.container.tags // []) | join(","))"' \
-              | sort -r
+              --jq '.[] | [.id, .name, ((.metadata.container.tags // [])|join(",")), .created_at] | @tsv' \
+              | sort -t$'\t' -k4 -r
           )
-          total=${#rows[@]}
-          echo "包 $ns/$pkg 当前 $total 个版本，保留最近 $KEEP 个"
-          dropped=0
-          if [ "$total" -gt "$KEEP" ]; then
-            for ((i=KEEP; i<total; i++)); do
-              IFS=$'\t' read -r ts id tags <<<"${rows[$i]}"
-              gh api --method DELETE "$base/container/$pkg/versions/$id" >/dev/null
-              echo "  已删除版本 $id（$ts，tags=${tags:-<none>}）"
-              dropped=$((dropped+1))
-            done
+          echo "包 $ns/$pkg 共 ${#all[@]} 个 version"
+
+          # 注意：多架构镜像一个 tag 会占 1 个 index + N 个子 manifest version，
+          # 所以按"version 个数"保留会把同一个镜像的兄弟架构删掉，必须按 tag 分组。
+          declare -A keep_index=() drop_index=()
+          kept=0
+          for row in "${all[@]}"; do
+            IFS=$'\t' read -r id name tags ts <<<"$row"
+            [ -n "$tags" ] || continue
+            if [ "$kept" -lt "$KEEP" ]; then
+              keep_index["$name"]="$tags"; kept=$((kept+1))
+            else
+              drop_index["$name"]="$tags"
+            fi
+          done
+
+          if [ ${#drop_index[@]} -eq 0 ]; then
+            echo "带 tag 的版本只有 $kept 个，未超过 $KEEP，无需裁剪"
+            echo "- prune：\`$ns/$pkg\` 带 tag 版本 $kept 个，未超过 $KEEP，未删除" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          echo "- prune：\`$ns/$pkg\` 共 $total 个版本，保留 $KEEP 个，删除 $dropped 个" >> "$GITHUB_STEP_SUMMARY"
+
+          # 保留的 tag 引用到的子 manifest 不能删（不同 tag 常共享同一架构镜像）
+          declare -A keep_ref=()
+          for d in "${!keep_index[@]}"; do
+            while IFS= read -r sub; do [ -n "$sub" ] && keep_ref["$sub"]=1; done < <(
+              skopeo inspect --raw "docker://${DST_REPO}@${d}" 2>/dev/null \
+                | jq -r '.manifests[]?.digest // empty' || true
+            )
+          done
+
+          # 待删 tag 的 index 及其子 manifest 一起进删除集
+          declare -A drop=()
+          for d in "${!drop_index[@]}"; do
+            drop["$d"]=1
+            while IFS= read -r sub; do
+              [ -n "$sub" ] && [ -z "${keep_ref[$sub]:-}" ] && drop["$sub"]=1
+            done < <(
+              skopeo inspect --raw "docker://${DST_REPO}@${d}" 2>/dev/null \
+                | jq -r '.manifests[]?.digest // empty' || true
+            )
+          done
+
+          dropped=0
+          for row in "${all[@]}"; do
+            IFS=$'\t' read -r id name tags ts <<<"$row"
+            [ -n "${drop[$name]:-}" ] || continue
+            [ -n "${keep_ref[$name]:-}" ] && { echo "保留 $name（仍被保留 tag 引用）"; continue; }
+            gh api --method DELETE "$base/container/$pkg/versions/$id" >/dev/null
+            echo "已删除 $id（$name，tags=${tags:-<none>}，$ts）"
+            dropped=$((dropped+1))
+          done
+          echo "- prune：\`$ns/$pkg\` 保留最近 $KEEP 个 tag（共 ${#all[@]} 个 version），删除 $dropped 个 version" >> "$GITHUB_STEP_SUMMARY"

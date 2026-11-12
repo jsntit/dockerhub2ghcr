@@ -41,6 +41,8 @@ Actions → **镜像搬运 DockerHub → GHCR** → Run workflow，填参数：
 | `tags` | | 沿用源 tag | 目标 tag，逗号分隔多个：`latest,1.27`；用 `@sha256` 引用源镜像时**必填** |
 | `platforms` | | `all` | `all` = 整份多架构；或 `linux/amd64`、`linux/arm64,linux/amd64` 只搬指定平台 |
 | `namespace` | | 仓库所有者 | GHCR 命名空间（用户或组织） |
+| `cleanup` | | `none` | `none` = 不碰已有包；`purge` = 推之前把整个包删掉再推（历史 tag 全清）；`prune` = 推完只保留最近 `keep_versions` 个 tag |
+| `keep_versions` | | `5` | `cleanup=prune` 时保留的 **tag** 数（按 tag 整组保留，不会拆散多架构镜像） |
 
 示例：`source=nginx:1.27`、`target=my-nginx`、`tags=latest,1.27`、`platforms=all`
 → 产出 `ghcr.io/<你>/my-nginx:latest` 和 `:1.27`，两个 tag 都是完整多架构。
@@ -55,6 +57,46 @@ docker pull ghcr.nju.edu.cn/<你>/my-nginx:latest
 ```
 
 运行结束后 Job Summary 会列出每个 tag 的平台清单、digest 和拉取命令，复制即可。
+
+## 清理已经推上去的镜像
+
+GitHub **没有批量删除包的入口**：只能在 `https://github.com/users/<你>/packages/container/<包名>/settings`
+里逐个点 Delete，包一多很烦。所以另带一个工作流 **清空 GHCR 包**（`purge-packages.yml`）。
+
+### 先配一个 token（必须）
+
+删包只能用 **PAT**：`GITHUB_TOKEN` 是 GitHub App 的安装令牌，访问 `/user/*` 一律
+`403 Resource not accessible by integration`，而删包 API 只有 `/user/packages` 和
+`/orgs/<org>/packages` 两条路。
+
+Settings → Developer settings → **Personal access tokens (classic)** → 勾
+`read:packages` + `delete:packages`（写代码仓库的话再加 `repo`）→ 生成后存到
+仓库 **Settings → Secrets and variables → Actions → `PACKAGES_TOKEN`**。
+
+### 参数
+
+Actions → **清空 GHCR 包** → Run workflow：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `scope` | `repo` | `repo` = 只删关联到本仓库的包；`all` = 账号/组织名下**所有**容器包 |
+| `packages` | 空 | 指定包名（逗号分隔），填了就忽略 `scope` |
+| `keep_versions` | `0` | `0` = 整包删除；>0 = 每个包只留最近 N 个 tag |
+| `dry_run` | `true` | 默认**只预览**，打印"会删什么"和版本数 |
+| `confirm` | 空 | 关掉 dry_run 后必须填 `DELETE`，否则直接报错退出 |
+
+跑完 Job Summary 有一张表：包名 / 版本数 / 动作 / 结果，最后一栏是复核剩余包。
+
+### 不想开 Actions 时
+
+```bash
+curl -X DELETE -H "Authorization: Bearer $GH_TOKEN" \
+     -H "Accept: application/vnd.github+json" \
+     https://api.github.com/user/packages/container/<包名>
+```
+
+组织下的包路径换成 `/orgs/<org>/packages/container/<包名>`；只删某个 tag 用
+`/user/packages/container/<包名>/versions/<version_id>`（先 `GET .../versions` 拿 id）。
 
 ## 两个必须知道的点
 
@@ -72,6 +114,11 @@ docker pull ghcr.nju.edu.cn/<你>/my-nginx:latest
 ## 其它
 
 - `platforms` 只搬部分架构时，目标是**重建的 manifest**（不含未选架构），tag 不带架构后缀。
+- `cleanup=purge` 是"推倒重来"，会连历史 tag 一起没了；只想控制版本数量用 `prune`。
+- `prune` 按 **tag 分组**：一个多架构 tag 在 GitHub 上占 1 个 index + N 个子 manifest
+  version（busybox 这种小镜像就有 18 个），按"version 个数"保留会把同一个镜像的兄弟架构删掉，
+  拉下来直接 404。删除旧 tag 时会把它的 index 和子 manifest 一起删，同时跳过仍被保留 tag
+  引用的子 digest（不同 tag 常共享同一平台镜像）。
 - 单个 job 上限 90 分钟；超大镜像建议自托管 runner。
 - 输入全部经环境变量传递，镜像名不会被当成 shell 命令执行。
 - 目标命名空间取仓库所有者（`github.repository_owner`），协作者触发也不会推到自己名下。

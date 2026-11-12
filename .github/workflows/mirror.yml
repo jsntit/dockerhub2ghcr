@@ -1,0 +1,224 @@
+name: 镜像搬运 DockerHub → GHCR（可指定平台）
+
+# 与旧版 main.yml / mailplatform.yml 的区别：
+#   1. 用 skopeo 直传 registry→registry，不落盘、不需要 dockerd，大镜像省一半磁盘与时间；
+#   2. 默认保留整份 manifest list（多架构/attestation 一起搬），ARM 拉下来不再报 exec format error；
+#   3. 目标命名空间取 github.repository_owner（而不是触发者 actor），协作者触发也不会推错地方；
+#   4. 输入全部走 env 传参，不再把 ${{ inputs.* }} 拼进 shell。
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: '源镜像：docker.io 可省略。例 nginx:1.27 / library/alpine / nginx@sha256:...'
+        required: true
+        default: 'nginx:latest'
+      target:
+        description: '目标镜像名（不含命名空间，留空=沿用源镜像名）；也可写 org/name'
+        required: false
+        default: ''
+      tags:
+        description: '目标 tag，逗号分隔（留空=沿用源 tag；用 @sha256 引用时必须填）'
+        required: false
+        default: ''
+      platforms:
+        description: 'all=整套多架构（推荐）；或逗号分隔，如 linux/amd64,linux/arm64'
+        required: false
+        default: 'all'
+      namespace:
+        description: 'GHCR 命名空间（用户/组织，默认仓库所有者）'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-${{ github.repository }}-${{ inputs.source }}-${{ inputs.target }}-${{ inputs.platforms }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: 规范化参数
+        id: norm
+        env:
+          SOURCE: ${{ inputs.source }}
+          TARGET: ${{ inputs.target }}
+          TAGS: ${{ inputs.tags }}
+          PLATFORMS: ${{ inputs.platforms }}
+          NAMESPACE: ${{ inputs.namespace }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+
+          raw="${SOURCE:-}"
+          raw="${raw#docker://}"
+          raw="${raw#https://}"; raw="${raw#http://}"
+          raw="$(echo "$raw" | tr -d '[:space:]')"
+          [ -n "$raw" ] || { echo "::error::source 不能为空"; exit 1; }
+
+          # 拆 digest / tag
+          digest=""
+          if [[ "$raw" == *"@sha256:"* ]]; then
+            repo="${raw%@*}"; digest="@${raw##*@}"; srctag=""
+          else
+            last="${raw##*/}"
+            if [[ "$last" == *:* ]]; then
+              repo="${raw%:*}"; srctag="${raw##*:}"
+            else
+              repo="$raw"; srctag="latest"
+            fi
+          fi
+
+          # 补默认 registry / library 前缀（skopeo 不像 docker 那样自动补）
+          first="${repo%%/*}"
+          if [[ "$repo" != */* ]]; then
+            repo="docker.io/library/${repo}"
+          elif [[ "$first" != *.* && "$first" != *:* && "$first" != "localhost" ]]; then
+            repo="docker.io/${repo}"
+          fi
+
+          # 目标仓库
+          default_name="${repo##*/}"
+          name="${TARGET:-$default_name}"
+          name="$(echo "$name" | tr '[:upper:]' '[:lower:]')"
+          ns="$(echo "${NAMESPACE:-$OWNER}" | tr '[:upper:]' '[:lower:]')"
+          case "$name" in
+            */*) dst_repo="ghcr.io/${name}" ;;
+            *)   dst_repo="ghcr.io/${ns}/${name}" ;;
+          esac
+
+          # tag 列表
+          if [ -n "${TAGS:-}" ]; then
+            taglist="$(echo "${TAGS:-}" | tr -d ' ' | tr ',' ' ')"
+          elif [ -n "$digest" ]; then
+            echo "::error::用 @sha256 引用源镜像时必须显式填 tags"; exit 1
+          else
+            taglist="$srctag"
+          fi
+          for t in $taglist; do
+            [[ "$t" =~ ^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$ ]] \
+              || { echo "::error::非法 tag：$t（只允许字母数字 _ . -，且不以 . 或 - 开头）"; exit 1; }
+          done
+
+          # 平台
+          plats="$(echo "${PLATFORMS:-all}" | tr -d ' ')"
+          if [ "$plats" != "all" ]; then
+            for p in $(echo "$plats" | tr ',' ' '); do
+              [[ "$p" == */* ]] || { echo "::error::平台格式应为 os/arch[/variant]：$p"; exit 1; }
+            done
+          fi
+
+          if [ -n "$digest" ]; then src_ref="${repo}${digest}"; else src_ref="${repo}:${srctag}"; fi
+
+          {
+            echo "src=$src_ref"
+            echo "src_repo=$repo"
+            echo "dst=$dst_repo"
+            echo "tags=$taglist"
+            echo "platforms=$plats"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### 搬运计划"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 源 | \`${src_ref}\` |"
+            echo "| 目标 | \`${dst_repo}\` |"
+            echo "| tag | \`${taglist}\` |"
+            echo "| 平台 | \`${plats}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 安装 skopeo
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends skopeo
+          skopeo --version
+
+      - name: 登录 GHCR
+        env:
+          GH_USER: ${{ github.actor }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
+
+      - name: 登录 Docker Hub（可选，规避匿名限流 429）
+        env:
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "${DH_USER}" ] || [ -z "${DH_TOKEN}" ]; then
+            echo "未配置 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN → 按匿名拉取（共享 runner IP 可能 429）"
+            exit 0
+          fi
+          printf '%s' "$DH_TOKEN" | docker login docker.io -u "$DH_USER" --password-stdin
+
+      - name: 复制镜像
+        env:
+          SRC_REF: ${{ steps.norm.outputs.src }}
+          SRC_REPO: ${{ steps.norm.outputs.src_repo }}
+          DST_REPO: ${{ steps.norm.outputs.dst }}
+          TAGS: ${{ steps.norm.outputs.tags }}
+          PLATFORMS: ${{ steps.norm.outputs.platforms }}
+        run: |
+          set -euo pipefail
+          for tag in $TAGS; do
+            dst="docker://${DST_REPO}:${tag}"
+            src="docker://${SRC_REF}"
+            if [ "$PLATFORMS" = "all" ]; then
+              echo "::group::skopeo copy --all ${SRC_REF} → ${DST_REPO}:${tag}"
+              skopeo copy --all --retry-times 3 "$src" "$dst"
+            else
+              echo "::group::按平台复制 ${PLATFORMS} ${SRC_REF} → ${DST_REPO}:${tag}"
+              index="$(skopeo inspect --raw "$src")"
+              refs=()
+              for p in $(echo "$PLATFORMS" | tr ',' ' '); do
+                os="${p%%/*}"; arch="${p#*/}"; variant=""
+                if [[ "$arch" == */* ]]; then variant="${arch#*/}"; arch="${arch%%/*}"; fi
+                d="$(jq -r --arg os "$os" --arg a "$arch" --arg v "$variant" '
+                  [ .manifests[]?
+                    | select(.platform.os == $os and .platform.architecture == $a
+                             and (($v == "") or ((.platform.variant // "") == $v))) ]
+                  | .[0].digest // empty' <<<"$index")"
+                [ -n "$d" ] || { echo "::error::源镜像没有平台 ${p}"; exit 1; }
+                refs+=("${SRC_REPO}@${d}")
+              done
+              docker buildx imagetools create -t "${DST_REPO}:${tag}" "${refs[@]}"
+            fi
+            echo "::endgroup::"
+          done
+
+      - name: 校验并输出使用说明
+        env:
+          DST_REPO: ${{ steps.norm.outputs.dst }}
+          TAGS: ${{ steps.norm.outputs.tags }}
+        run: |
+          set -euo pipefail
+          rc=0
+          for tag in $TAGS; do
+            raw="$(skopeo inspect --raw "docker://${DST_REPO}:${tag}" 2>/dev/null || true)"
+            if [ -z "$raw" ]; then
+              echo "::error::${DST_REPO}:${tag} 校验失败（拉不到 manifest）"; rc=1; continue
+            fi
+            plats="$(jq -r 'if .manifests then
+                               [ .manifests[] | select(.platform.os != "unknown")
+                                 | "\(.platform.os)/\(.platform.architecture)" + (if .platform.variant then "/"+.platform.variant else "" end) ]
+                               | unique | join(" ")
+                             else "single-platform" end' <<<"$raw" 2>/dev/null || echo "?")"
+            digest="$(skopeo inspect --format '{{.Digest}}' "docker://${DST_REPO}:${tag}" 2>/dev/null || echo '?')"
+            {
+              echo "### ${DST_REPO}:${tag}"
+              echo ""
+              echo "- 平台：\`${plats}\`"
+              echo "- digest：\`${digest}\`"
+              echo "- 拉取：\`docker pull ${DST_REPO}:${tag}\`"
+              echo "- 国内加速：\`docker pull ${DST_REPO/ghcr.io/ghcr.nju.edu.cn}:${tag}\`"
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit "$rc"

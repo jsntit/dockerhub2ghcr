@@ -165,11 +165,15 @@ jobs:
       - name: 清理目标包（cleanup=purge：先整包删除）
         if: inputs.cleanup == 'purge'
         env:
-          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
           DST_REPO: ${{ steps.norm.outputs.dst }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::cleanup 需要 secret PACKAGES_TOKEN（classic PAT，勾 read:packages + delete:packages）。GITHUB_TOKEN 是 App 令牌，访问 /user/packages 会 403。"
+            exit 1
+          fi
           ns="$(echo "$DST_REPO" | sed -E 's#^ghcr\.io/##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
           pkg="${DST_REPO##*/}"
           owner="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
@@ -268,12 +272,16 @@ jobs:
       - name: 裁剪旧版本（cleanup=prune：只保留最近 N 个）
         if: inputs.cleanup == 'prune'
         env:
-          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
           DST_REPO: ${{ steps.norm.outputs.dst }}
           REPO_OWNER: ${{ github.repository_owner }}
           KEEP: ${{ inputs.keep_versions }}
         run: |
           set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::cleanup 需要 secret PACKAGES_TOKEN（classic PAT，勾 read:packages + delete:packages）。GITHUB_TOKEN 是 App 令牌，访问 /user/packages 会 403。"
+            exit 1
+          fi
           pkg="${DST_REPO##*/}"
           ns="$(echo "$DST_REPO" | sed -E 's#^ghcr\.io/##; s#/.*$##' | tr '[:upper:]' '[:lower:]')"
           owner="$(echo "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"

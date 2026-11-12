@@ -49,13 +49,21 @@ jobs:
     steps:
       - name: 预检参数与 token
         env:
-          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+          HAS_TOKEN: ${{ secrets.PACKAGES_TOKEN != '' }}
           DRY: ${{ inputs.dry_run }}
           CONFIRM: ${{ inputs.confirm }}
           KEEP: ${{ inputs.keep_versions }}
           SCOPE: ${{ inputs.scope }}
         run: |
           set -euo pipefail
+
+          # GITHUB_TOKEN 是 GitHub App 令牌，访问 /user/* 一律 403，
+          # 而删包只能走 /user/packages 或 /orgs/<org>/packages，所以必须用 PAT。
+          if [ "${HAS_TOKEN}" != "true" ]; then
+            echo "::error::缺少 secret PACKAGES_TOKEN。请用 classic PAT（勾 read:packages + delete:packages）存到 Settings → Secrets and variables → Actions → PACKAGES_TOKEN。GITHUB_TOKEN 无权删包。"
+            exit 1
+          fi
 
           login="$(gh api /user --jq .login)"
           echo "token 身份：$login"
@@ -82,7 +90,7 @@ jobs:
 
       - name: 执行清空
         env:
-          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
           DRY: ${{ inputs.dry_run }}
           KEEP: ${{ inputs.keep_versions }}
           SCOPE: ${{ inputs.scope }}
@@ -195,7 +203,7 @@ jobs:
 
       - name: 复核剩余
         env:
-          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
           REPO_FULL: ${{ github.repository }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
